@@ -1,4 +1,4 @@
-// app.vue
+<!-- app.vue -->
 <template>
   <div>
     <NuxtLayout>
@@ -8,46 +8,22 @@
 </template>
 
 <script setup>
-import { useGameStore } from '~/composables/useGameStore'
+import { useSocketEvents } from '~/composables/useSocketEvents'
 
-const { $socket } = useNuxtApp()
-const gameStore = useGameStore()
+const { setupGlobalEvents, clearEvents } = useSocketEvents()
 
-// 웹소켓 이벤트 리스너 설정
 onMounted(() => {
-  $socket.on('connect', () => {
-    console.log('Connected to server')
-  })
-
-  $socket.on('error', ({ message }) => {
-    gameStore.setError(message)
-  })
-
-  $socket.on('gameStateUpdated', (newState) => {
-    gameStore.updateGameState(newState)
-  })
-
-  $socket.on('gameStarted', (initialState) => {
-    gameStore.initializeGame(
-      initialState.roomId,
-      initialState.players,
-      initialState.gameMode
-    )
-  })
-
-  $socket.on('gameEnded', ({ winner }) => {
-    gameStore.status = 'finished'
-    gameStore.setGameMessage(`게임 종료! 승자: ${winner.name}`)
-  })
+  setupGlobalEvents()
 })
 
 onUnmounted(() => {
-  // 이벤트 리스너 정리
-  $socket.off('connect')
-  $socket.off('error')
-  $socket.off('gameStateUpdated')
-  $socket.off('gameStarted')
-  $socket.off('gameEnded')
+  clearEvents([
+    'connect',
+    'error',
+    'gameStateUpdated',
+    'gameStarted',
+    'gameEnded'
+  ])
 })
 </script>
 

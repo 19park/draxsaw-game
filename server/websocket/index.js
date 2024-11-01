@@ -336,6 +336,152 @@ export default function (httpServer) {
       broadcastGamesList()  // 게임 목록 업데이트
     })
 
+    socket.on('drawCard', ({ roomId }) => {
+      const room = gameRooms.get(roomId)
+      if (!room || room.status !== 'playing') return
+
+      const gameState = room.gameState
+      const currentPlayer = gameState.players.find(p => p.id === socket.id)
+
+      if (!currentPlayer) {
+        socket.emit('error', { message: '플레이어를 찾을 수 없습니다.' })
+        return
+      }
+
+      if (currentPlayer.hand.length >= 3) {
+        socket.emit('error', { message: '더 이상 카드를 뽑을 수 없습니다.' })
+        return
+      }
+
+      // 덱에서 카드 뽑기
+      if (gameState.deck.length === 0) {
+        // 버린 카드 덱을 섞어서 새로운 덱 만들기
+        if (gameState.discardPile.length === 0) {
+          socket.emit('error', { message: '더 이상 뽑을 카드가 없습니다.' })
+          return
+        }
+        gameState.deck = [...gameState.discardPile].sort(() => Math.random() - 0.5)
+        gameState.discardPile = []
+      }
+
+      const drawnCard = gameState.deck.pop()
+      currentPlayer.hand.push(drawnCard)
+
+      io.to(roomId).emit('cardDrawn', {
+        playerId: socket.id,
+        handCount: currentPlayer.hand.length
+      })
+
+      io.to(roomId).emit('gameStateUpdated', gameState)
+    })
+
+    socket.on('discardCard', ({ roomId, cardId }) => {
+      const room = gameRooms.get(roomId)
+      if (!room || room.status !== 'playing') return
+
+      const gameState = room.gameState
+      const currentPlayer = gameState.players.find(p => p.id === socket.id)
+
+      if (!currentPlayer) {
+        socket.emit('error', { message: '플레이어를 찾을 수 없습니다.' })
+        return
+      }
+
+      const cardIndex = currentPlayer.hand.findIndex(card => card.id === cardId)
+      if (cardIndex === -1) {
+        socket.emit('error', { message: '카드를 찾을 수 없습니다.' })
+        return
+      }
+
+      // 카드 버리기
+      const discardedCard = currentPlayer.hand.splice(cardIndex, 1)[0]
+      gameState.discardPile.push(discardedCard)
+
+      io.to(roomId).emit('cardDiscarded', {
+        playerId: socket.id,
+        card: discardedCard
+      })
+
+      io.to(roomId).emit('gameStateUpdated', gameState)
+    })
+
+// 기존의 playCard 핸들러 수정
+    socket.on('playCard', ({ roomId, cardId, targetPigId, targetPlayerId }) => {
+      const room = gameRooms.get(roomId)
+      if (!room || room.status !== 'playing') return
+
+      const gameState = room.gameState
+      const currentPlayer = gameState.players[gameState.currentPlayerIndex]
+
+      if (currentPlayer.id !== socket.id) {
+        socket.emit('error', { message: '자신의 턴이 아닙니다.' })
+        return
+      }
+
+      const cardIndex = currentPlayer.hand.findIndex(card => card.id === cardId)
+      if (cardIndex === -1) {
+        socket.emit('error', { message: '카드를 찾을 수 없습니다.' })
+        return
+      }
+
+      const card = currentPlayer.hand[cardIndex]
+      const result = handleCardPlay(gameState, card, targetPigId, targetPlayerId)
+
+      if (result.success) {
+        // 카드 제거 및 새 카드 뽑기
+        currentPlayer.hand.splice(cardIndex, 1)
+        gameState.discardPile.push(card)
+
+        io.to(roomId).emit('cardPlayed', {
+          playerId: socket.id,
+          card,
+          targetPigId,
+          targetPlayerId,
+          effect: result.effect
+        })
+
+        io.to(roomId).emit('gameStateUpdated', gameState)
+
+        // 승리 조건 체크
+        const winner = checkWinCondition(gameState)
+        if (winner) {
+          room.status = 'finished'
+          io.to(roomId).emit('gameEnded', { winner })
+        }
+      } else {
+        socket.emit('error', { message: result.message })
+      }
+    })
+
+  // 기존의 endTurn 핸들러 수정
+    socket.on('endTurn', ({ roomId }) => {
+      const room = gameRooms.get(roomId)
+      if (!room || room.status !== 'playing') return
+
+      const gameState = room.gameState
+      if (gameState.players[gameState.currentPlayerIndex].id !== socket.id) {
+        socket.emit('error', { message: '자신의 턴이 아닙니다.' })
+        return
+      }
+
+      // 현재 턴 종료 알림
+      io.to(roomId).emit('turnEnded', {
+        playerId: socket.id
+      })
+
+      // 다음 플레이어로 턴 전환
+      gameState.currentPlayerIndex = (gameState.currentPlayerIndex + 1) % gameState.players.length
+      gameState.turnCount++
+
+      // 새로운 턴 시작 알림
+      io.to(roomId).emit('turnStarted', {
+        playerId: gameState.players[gameState.currentPlayerIndex].id,
+        turnCount: gameState.turnCount
+      })
+
+      io.to(roomId).emit('gameStateUpdated', gameState)
+    })
+
     // 연결 해제
     // 연결 해제 시에도 게임 목록 업데이트
     socket.on('disconnect', () => {
@@ -382,15 +528,191 @@ export default function (httpServer) {
 }
 
 // 카드 사용 처리 로직
-function handleCardPlay(gameState, cardId, targetId) {
-  // 실제 카드 효과 처리 로직 구현
-  return {
-    success: true,
-    action: {
-      type: 'playCard',
-      cardId,
-      targetId
-    }
+function handleCardPlay(gameState, card, targetPigId, targetPlayerId) {
+  const currentPlayer = gameState.players[gameState.currentPlayerIndex]
+  const targetPlayer = targetPlayerId ?
+    gameState.players.find(p => p.id === targetPlayerId) : currentPlayer
+  const targetPig = targetPigId ?
+    targetPlayer.pigs.find(pig => pig.id === targetPigId) : null
+
+  switch (card.type) {
+    case 'mud':
+      // 진흙 카드: 깨끗한 돼지를 더럽힘
+      if (!targetPig || targetPig.status !== 'clean') {
+        return { success: false, message: '깨끗한 돼지만 더럽힐 수 있습니다.' }
+      }
+      targetPig.status = 'dirty'
+      return {
+        success: true,
+        effect: {
+          type: 'STATUS_CHANGE',
+          pigId: targetPigId,
+          playerId: targetPlayerId,
+          from: 'clean',
+          to: 'dirty'
+        }
+      }
+
+    case 'barn':
+      // 헛간 카드: 돼지에게 헛간 설치
+      if (!targetPig || targetPig.barn) {
+        return { success: false, message: '이미 헛간이 있거나 유효하지 않은 돼지입니다.' }
+      }
+      targetPig.barn = {
+        hasLightningRod: false,
+        isLocked: false
+      }
+      return {
+        success: true,
+        effect: {
+          type: 'ADD_BARN',
+          pigId: targetPigId,
+          playerId: targetPlayerId
+        }
+      }
+
+    case 'bath':
+      // 목욕 카드: 더러운 돼지를 깨끗하게 만듦
+      if (!targetPig ||
+        targetPig.status !== 'dirty' ||
+        (targetPig.barn && targetPig.barn.isLocked)) {
+        return { success: false, message: '목욕시킬 수 없는 돼지입니다.' }
+      }
+      targetPig.status = 'clean'
+      return {
+        success: true,
+        effect: {
+          type: 'STATUS_CHANGE',
+          pigId: targetPigId,
+          playerId: targetPlayerId,
+          from: 'dirty',
+          to: 'clean'
+        }
+      }
+
+    case 'rain':
+      // 비 카드: 헛간이 없는 모든 더러운 돼지를 깨끗하게 만듦
+      let rainEffect = false
+      gameState.players.forEach(player => {
+        player.pigs.forEach(pig => {
+          if (pig.status === 'dirty' && !pig.barn) {
+            pig.status = 'clean'
+            rainEffect = true
+          }
+        })
+      })
+      if (!rainEffect) {
+        return { success: false, message: '비의 영향을 받을 수 있는 돼지가 없습니다.' }
+      }
+      return {
+        success: true,
+        effect: {
+          type: 'RAIN',
+          affectedPigs: gameState.players.map(player => ({
+            playerId: player.id,
+            pigs: player.pigs.map(pig => ({
+              pigId: pig.id,
+              wasAffected: pig.status === 'clean' && !pig.barn
+            }))
+          }))
+        }
+      }
+
+    case 'lightning':
+      // 벼락 카드: 피뢰침이 없는 헛간을 파괴
+      if (!targetPig || !targetPig.barn || targetPig.barn.hasLightningRod) {
+        return { success: false, message: '파괴할 수 있는 헛간이 없습니다.' }
+      }
+      delete targetPig.barn
+      return {
+        success: true,
+        effect: {
+          type: 'DESTROY_BARN',
+          pigId: targetPigId,
+          playerId: targetPlayerId
+        }
+      }
+
+    case 'lightning_rod':
+      // 피뢰침 카드: 헛간에 피뢰침 설치
+      if (!targetPig || !targetPig.barn || targetPig.barn.hasLightningRod) {
+        return { success: false, message: '피뢰침을 설치할 수 없는 헛간입니다.' }
+      }
+      targetPig.barn.hasLightningRod = true
+      return {
+        success: true,
+        effect: {
+          type: 'ADD_LIGHTNING_ROD',
+          pigId: targetPigId,
+          playerId: targetPlayerId
+        }
+      }
+
+    case 'barn_lock':
+      // 헛간 잠금 카드: 헛간을 잠가서 목욕으로부터 보호
+      if (!targetPig || !targetPig.barn || targetPig.barn.isLocked) {
+        return { success: false, message: '잠글 수 없는 헛간입니다.' }
+      }
+      targetPig.barn.isLocked = true
+      return {
+        success: true,
+        effect: {
+          type: 'LOCK_BARN',
+          pigId: targetPigId,
+          playerId: targetPlayerId
+        }
+      }
+
+    case 'beautiful_pig':
+      // 아름다운 돼지 카드 (확장팩): 돼지를 아름답게 만듦
+      if (!targetPig || targetPig.status === 'beautiful' ||
+        (targetPig.barn && targetPig.barn.isLocked)) {
+        return { success: false, message: '아름답게 만들 수 없는 돼지입니다.' }
+      }
+      targetPig.status = 'beautiful'
+      return {
+        success: true,
+        effect: {
+          type: 'STATUS_CHANGE',
+          pigId: targetPigId,
+          playerId: targetPlayerId,
+          from: targetPig.status,
+          to: 'beautiful'
+        }
+      }
+
+    case 'escape':
+      // 도망 카드 (확장팩): 아름다운 돼지를 원래 상태로 되돌림
+      if (!targetPig || targetPig.status !== 'beautiful') {
+        return { success: false, message: '도망갈 수 없는 돼지입니다.' }
+      }
+      targetPig.status = 'clean'
+      return {
+        success: true,
+        effect: {
+          type: 'STATUS_CHANGE',
+          pigId: targetPigId,
+          playerId: targetPlayerId,
+          from: 'beautiful',
+          to: 'clean'
+        }
+      }
+
+    case 'lucky_bird':
+      // 행운의 새 카드 (확장팩): 손에 있는 다른 모든 카드를 즉시 사용
+      if (currentPlayer.hand.length <= 1) {
+        return { success: false, message: '사용할 수 있는 다른 카드가 없습니다.' }
+      }
+      return {
+        success: true,
+        effect: {
+          type: 'LUCKY_BIRD',
+          playerId: currentPlayer.id
+        }
+      }
+
+    default:
+      return { success: false, message: '알 수 없는 카드 타입입니다.' }
   }
 }
 
