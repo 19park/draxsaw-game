@@ -1,59 +1,43 @@
-// composables/useSocketStatus.ts
+// composables/useSocketStatus.js
 import { ref, onMounted, onUnmounted } from 'vue'
 
 export function useSocketStatus() {
-  const isConnected = ref(false)
-  const connectionError = ref(null)
-  const reconnectAttempts = ref(0)
   const { $socket } = useNuxtApp()
-
-  const checkConnection = () => {
-    $socket.emit('ping')
-  }
+  const status = ref('disconnected')
+  const error = ref(null)
 
   const setupSocketListeners = () => {
+    if (!$socket) return
+
     $socket.on('connect', () => {
-      console.log('Socket connected')
-      isConnected.value = true
-      connectionError.value = null
-      reconnectAttempts.value = 0
+      status.value = 'connected'
+      error.value = null
     })
 
     $socket.on('disconnect', (reason) => {
+      status.value = 'disconnected'
       console.log('Socket disconnected:', reason)
-      isConnected.value = false
     })
 
-    $socket.on('connect_error', (error) => {
-      console.error('Connection error:', error)
-      isConnected.value = false
-      connectionError.value = error.message
-      reconnectAttempts.value++
-    })
-
-    $socket.on('pong', () => {
-      isConnected.value = true
+    $socket.on('connect_error', (err) => {
+      status.value = 'error'
+      error.value = err.message
+      console.error('Connection error:', err)
     })
   }
 
-  // 주기적으로 연결 상태 확인
-  let connectionCheck
-  onMounted(() => {
-    setupSocketListeners()
-    connectionCheck = setInterval(checkConnection, 5000)
-  })
+  const clearSocketListeners = () => {
+    if (!$socket) return
 
-  onUnmounted(() => {
-    if (connectionCheck) clearInterval(connectionCheck)
     $socket.off('connect')
     $socket.off('disconnect')
     $socket.off('connect_error')
-    $socket.off('pong')
-  })
+  }
 
   return {
-    isConnected,
-    connectionError,
-    reconnectAttempts
+    status,
+    error,
+    setupSocketListeners,
+    clearSocketListeners
   }
 }

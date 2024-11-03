@@ -6,11 +6,6 @@ export default defineNuxtConfig({
     '@pinia/nuxt',
     '@nuxtjs/tailwindcss',
   ],
-  runtimeConfig: {
-    public: {
-      wsUrl: process.env.NUXT_PUBLIC_WS_URL || 'http://localhost:3001'
-    }
-  },
   css: ['~/assets/css/main.css'],
   postcss: {
     plugins: {
@@ -31,8 +26,7 @@ export default defineNuxtConfig({
   nitro: {
     routeRules: {
       '/socket.io/**': {
-        proxy: 'http://localhost:3001/socket.io/**',
-        ws: true
+        proxy: 'http://localhost:3001/socket.io/**'
       }
     }
   },
@@ -40,9 +34,7 @@ export default defineNuxtConfig({
   runtimeConfig: {
     public: {
       wsUrl: process.env.NUXT_PUBLIC_WS_URL || 'http://localhost:3001',
-      wsPath: '/socket.io/',
-      wsReconnectionAttempts: 10,
-      wsReconnectionDelay: 1000,
+      wsPath: '/socket.io/'
     }
   },
 
@@ -51,8 +43,8 @@ export default defineNuxtConfig({
       proxy: {
         '/socket.io': {
           target: 'http://localhost:3001',
-          ws: true,
-          changeOrigin: true
+          changeOrigin: true,
+          ws: true
         }
       }
     }

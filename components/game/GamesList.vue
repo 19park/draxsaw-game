@@ -2,11 +2,11 @@
 <template>
   <div class="active-games">
     <h2 class="subtitle">진행 중인 게임</h2>
-    <div v-if="games.length === 0" class="no-games">
+    <div v-if="props.games.length === 0" class="no-games">
       현재 진행 중인 게임이 없습니다
     </div>
     <div v-else class="games-list">
-      <div v-for="game in games"
+      <div v-for="game in props.games"
            :key="game.id"
            class="game-item">
         <div class="game-info">
@@ -36,7 +36,9 @@
   </div>
 </template>
 
+<!-- components/game/GamesList.vue -->
 <script setup>
+import { defineProps, defineEmits, onMounted, onUnmounted } from 'vue';
 const props = defineProps({
   games: {
     type: Array,
@@ -45,7 +47,35 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['join'])
+const emit = defineEmits(['join', 'refresh'])
+const { $socket } = useNuxtApp()
+let refreshInterval = null
+
+onMounted(() => {
+  // 컴포넌트 마운트 시 게임 목록 요청
+  if ($socket?.connected) {
+    $socket.emit('getGames')
+  }
+
+  // 소켓 이벤트 리스너 등록
+  $socket.on('gamesList', (games) => {
+    console.log('Received games list:', games)
+  })
+
+  // 주기적으로 게임 목록 갱신
+  refreshInterval = setInterval(() => {
+    if ($socket?.connected) {
+      $socket.emit('getGames')
+    }
+  }, 3000)
+})
+
+onUnmounted(() => {
+  if (refreshInterval) {
+    clearInterval(refreshInterval)
+  }
+  $socket.off('gamesList')
+})
 
 const handleJoin = (gameId) => {
   emit('join', gameId)

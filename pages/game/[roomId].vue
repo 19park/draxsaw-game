@@ -2,27 +2,32 @@
 <template>
   <div class="game-room">
     <!-- 대기실 상태 -->
-    <div v-if="gameStore.status === 'waiting'" class="waiting-room">
+    <div v-if="gameStore.gameState?.status === 'waiting'" class="waiting-room">
       <div class="room-info">
         <h2 class="title">게임 대기실 #{{ roomId }}</h2>
-        <div class="game-mode-badge" :class="gameStore.gameMode">
-          {{ gameStore.gameMode === 'basic' ? '기본' : '확장팩' }} 모드
+        <div
+          class="game-mode-badge"
+          :class="gameStore.gameState?.gameMode"
+        >
+          {{ gameStore.gameState?.gameMode === 'basic' ? '기본' : '확장팩' }} 모드
         </div>
       </div>
 
       <!-- 플레이어 목록 -->
       <div class="players-container">
         <div class="players-grid">
-          <div v-for="player in gameStore.players"
-               :key="player.id"
-               class="player-card"
-               :class="{
-                 'ready': player.ready,
-                 'is-me': isCurrentPlayer(player.id)
-               }">
+          <div
+            v-for="player in gameStore.gameState?.players"
+            :key="player.id"
+            class="player-card"
+            :class="{
+              'ready': player.ready,
+              'is-me': isCurrentPlayer(player.id)
+            }"
+          >
             <div class="player-content">
               <div class="player-avatar">
-                {{ player.name[0].toUpperCase() }}
+                {{ getPlayerInitial(player.name) }}
               </div>
               <div class="player-info">
                 <div class="player-name">
@@ -38,9 +43,11 @@
           </div>
 
           <!-- 빈 슬롯 -->
-          <div v-for="i in (4 - gameStore.players.length)"
-               :key="`empty-${i}`"
-               class="player-card empty">
+          <div
+            v-for="i in remainingSlots"
+            :key="`empty-${i}`"
+            class="player-card empty"
+          >
             <div class="empty-slot">
               다른 플레이어 대기중...
             </div>
@@ -50,16 +57,20 @@
 
       <!-- 게임 컨트롤 -->
       <div class="game-controls">
-        <button v-if="amIOwner"
-                class="start-button"
-                :disabled="!canStartGame"
-                @click="startGame">
+        <button
+          v-if="amIOwner"
+          class="start-button"
+          :disabled="!canStartGame"
+          @click="startGame"
+        >
           게임 시작
         </button>
-        <button class="ready-button"
-                :class="{ 'is-ready': gameStore.isReady }"
-                @click="toggleReady">
-          {{ gameStore.isReady ? '준비 해제' : '준비하기' }}
+        <button
+          class="ready-button"
+          :class="{ 'is-ready': gameStore.gameState?.isReady }"
+          @click="toggleReady"
+        >
+          {{ gameStore.gameState?.isReady ? '준비 해제' : '준비하기' }}
         </button>
         <button class="leave-button" @click="leaveRoom">
           나가기
@@ -67,30 +78,36 @@
       </div>
 
       <!-- 상태 메시지 -->
-      <div v-if="statusMessage" class="status-message" :class="messageType">
+      <div
+        v-if="statusMessage"
+        class="status-message"
+        :class="messageType"
+      >
         {{ statusMessage }}
       </div>
     </div>
 
     <!-- 게임 진행 상태 -->
     <GameBoard
-      v-else-if="gameStore.status === 'playing'"
+      v-else-if="gameStore.gameState?.status === 'playing'"
       :room-id="roomId"
-      :current-player-id="$socket.id"
-      :players="gameStore.players"
-      :game-mode="gameStore.gameMode"
+      :current-player-id="socketId"
+      :players="gameStore.gameState?.players || []"
+      :game-mode="gameStore.gameState?.gameMode"
     />
 
     <!-- 게임 종료 상태 -->
-    <div v-else-if="gameStore.status === 'finished'" class="game-result">
+    <div v-else-if="gameStore.gameState?.status === 'finished'" class="game-result">
       <h2 class="title">게임 종료!</h2>
-      <div v-if="gameStore.winner" class="winner-info">
-        승자: {{ gameStore.winner.name }}
+      <div v-if="winner" class="winner-info">
+        승자: {{ winner.name }}
       </div>
       <div class="result-controls">
-        <button v-if="amIOwner"
-                class="rematch-button"
-                @click="requestRematch">
+        <button
+          v-if="amIOwner"
+          class="rematch-button"
+          @click="requestRematch"
+        >
           다시하기
         </button>
         <button class="to-lobby-button" @click="goToLobby">
@@ -102,7 +119,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import GameBoard from '~/components/game/GameBoard.vue'
 import { useGameStore } from '~/composables/useGameStore'
@@ -118,24 +135,60 @@ const { setupRoomEvents, clearEvents } = useSocketEvents()
 const roomId = ref(route.params.roomId)
 const statusMessage = ref('')
 const messageType = ref('info')
+const maxPlayers = 4
+const socketId = computed(() => $socket?.id)
 
-// 계산된 속성
+// Computed 속성들
 const amIOwner = computed(() => {
-  return gameStore.currentRoom?.owner === $socket.id
+  const currentRoom = gameStore.gameState?.currentRoom
+  const myId = socketId.value
+  return currentRoom?.owner === myId
+})
+
+const playerCount = computed(() => {
+  return gameStore.gameState?.players?.length || 0
+})
+
+const remainingSlots = computed(() => {
+  const maxPlayers = gameStore.gameState?.maxPlayers || 4
+  return maxPlayers - playerCount.value
 })
 
 const canStartGame = computed(() => {
-  return gameStore.players.length >= 2 &&
-    gameStore.players.every(player => player.ready)
+  const players = gameStore.gameState?.players || []
+  return playerCount.value >= 2 &&
+    players.every(player => player?.ready)
 })
 
-// 메서드
-const isCurrentPlayer = (playerId) => {
-  return playerId === $socket.id
+const winner = computed(() => {
+  const players = gameStore.gameState?.players || []
+  return players.find(player => {
+    if (gameStore.gameState?.gameMode === 'basic') {
+      return player.pigs?.every(pig => pig.status === 'dirty')
+    }
+    return (player.pigs?.every(pig => pig.status === 'dirty') ||
+      player.pigs?.every(pig => pig.status === 'beautiful'))
+  })
+})
+
+const startGameMessage = computed(() => {
+  if (playerCount.value < 2) {
+    return '최소 2명의 플레이어가 필요합니다'
+  }
+  const players = gameStore.gameState?.players || []
+  if (!players.every(player => player?.ready)) {
+    return '모든 플레이어가 준비를 완료해야 합니다'
+  }
+  return ''
+})
+
+// 유틸리티 함수들
+const generatePlayerName = () => {
+  return `Player_${Math.random().toString(36).substring(7)}`
 }
 
-const isRoomOwner = (playerId) => {
-  return playerId === gameStore.currentRoom?.owner
+const getPlayerInitial = (name) => {
+  return name ? name[0].toUpperCase() : '?'
 }
 
 const showMessage = (message, type = 'info') => {
@@ -146,62 +199,100 @@ const showMessage = (message, type = 'info') => {
   }, 3000)
 }
 
+// 플레이어 관련 함수들
+const isCurrentPlayer = (playerId) => {
+  return playerId === socketId.value
+}
+
+const isRoomOwner = (playerId) => {
+  return playerId === gameStore.gameState?.currentRoom?.owner
+}
+
+// 게임 액션 함수들
 const toggleReady = () => {
+  const currentRoomId = gameStore.gameState?.roomId
+  if (!currentRoomId || !socketId.value) return
+
   $socket.emit('toggleReady', {
-    roomId: roomId.value,
-    ready: !gameStore.isReady
+    roomId: currentRoomId,
+    ready: !gameStore.gameState?.isReady
   })
 }
 
+const leaveRoom = async () => {
+  const currentRoomId = gameStore.gameState?.roomId
+  if (currentRoomId) {
+    $socket.emit('leaveRoom', {
+      roomId: currentRoomId
+    })
+    gameStore.leaveRoom()
+  }
+  await router.push('/lobby')
+}
+
 const startGame = () => {
-  if (!canStartGame.value) {
-    showMessage('모든 플레이어가 준비를 완료해야 합니다', 'error')
+  if (!canStartGame.value || !gameStore.gameState?.roomId) {
+    showMessage('게임을 시작할 수 없습니다.', 'error')
     return
   }
 
   $socket.emit('startGame', {
-    roomId: roomId.value
+    roomId: gameStore.gameState.roomId
   })
-}
-
-const leaveRoom = () => {
-  $socket.emit('leaveRoom', { roomId: roomId.value })
-  router.push('/lobby')
 }
 
 const requestRematch = () => {
-  $socket.emit('requestRematch', { roomId: roomId.value })
+  if (!gameStore.gameState?.roomId) return
+  $socket.emit('requestRematch', {
+    roomId: gameStore.gameState.roomId
+  })
 }
 
-const goToLobby = () => {
-  router.push('/lobby')
+const goToLobby = async () => {
+  await router.push('/lobby')
 }
 
+// 라이프사이클 훅
 onMounted(() => {
+  if (!roomId.value) {
+    router.push('/lobby')
+    return
+  }
+
   setupRoomEvents()
 
-  // 방 참여 요청
-  $socket.emit('joinRoom', {
-    roomId: roomId.value,
-    playerName: `Player_${Math.random().toString(36).substring(7)}`
-  })
+  if (socketId.value) {
+    $socket.emit('joinRoom', {
+      roomId: roomId.value,
+      playerName: generatePlayerName()
+    })
+  }
 })
 
 onUnmounted(() => {
   clearEvents([
     'roomState',
     'roomUpdated',
-    'playerLeft'
+    'playerLeft',
+    'gameStarted',
+    'gameEnded'
   ])
 })
 
-// 상태 변화 감시
-watch(() => gameStore.status, (newState, oldState) => {
-  console.log('Game state changed:', { from: oldState, to: newState })
+// 감시자
+watch(socketId, (newId, oldId) => {
+  if (newId && newId !== oldId && roomId.value) {
+    $socket.emit('joinRoom', {
+      roomId: roomId.value,
+      playerName: generatePlayerName()
+    })
+  }
 })
 
-watch(() => gameStore.players, (newPlayers) => {
-  console.log('Players updated:', newPlayers)
+watch(() => gameStore.gameState?.status, (newState, oldState) => {
+  if (newState !== oldState) {
+    console.log('Game state changed:', { from: oldState, to: newState })
+  }
 })
 </script>
 
@@ -239,7 +330,7 @@ watch(() => gameStore.players, (newPlayers) => {
 }
 
 .players-grid {
-  @apply grid grid-cols-2 gap-4;
+  @apply grid grid-cols-1 sm:grid-cols-2 gap-4;
 }
 
 .player-card {
@@ -344,10 +435,12 @@ watch(() => gameStore.players, (newPlayers) => {
 }
 
 .rematch-button {
-  @apply px-6 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600;
+  @apply px-6 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600
+  transition-colors;
 }
 
 .to-lobby-button {
-  @apply px-6 py-2 bg-gray-500 text-white rounded-lg hover:bg-gray-600;
+  @apply px-6 py-2 bg-gray-500 text-white rounded-lg hover:bg-gray-600
+  transition-colors;
 }
 </style>

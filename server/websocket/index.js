@@ -2,29 +2,30 @@
 import { Server } from 'socket.io'
 import { nanoid } from 'nanoid'
 
-export default function (httpServer) {
+export default function setupWebSocket(httpServer) {
   const io = new Server(httpServer, {
     cors: {
-      origin: process.env.NODE_ENV === 'development'
-        ? ['http://localhost:3000', 'http://127.0.0.1:3000']
-        : process.env.CLIENT_URL,
+      origin: ['http://localhost:3000', 'http://127.0.0.1:3000'],
       methods: ['GET', 'POST'],
-      credentials: true
+      credentials: true,
+      allowedHeaders: ['Content-Type']
     },
-    transports: ['websocket', 'polling'],
+    transports: ['polling', 'websocket'],
+    path: '/socket.io/',
+    serveClient: false,
     pingTimeout: 30000,
     pingInterval: 25000,
     upgradeTimeout: 30000,
     maxHttpBufferSize: 1e8,
-    path: '/socket.io/',
     allowEIO3: true
   })
 
-  // 게임 룸과 상태 관리
+  // 게임 룸 관리
   const gameRooms = new Map()
-  // 카드 덱 생성 함수
+
+  // 유틸리티 함수들
   const createDeck = (gameMode) => {
-    let deck = [
+    const basicCards = [
       ...Array(21).fill().map((_, i) => ({ id: `mud-${i}`, type: 'mud' })),
       ...Array(9).fill().map((_, i) => ({ id: `barn-${i}`, type: 'barn' })),
       ...Array(8).fill().map((_, i) => ({ id: `bath-${i}`, type: 'bath' })),
@@ -34,218 +35,268 @@ export default function (httpServer) {
       ...Array(4).fill().map((_, i) => ({ id: `barn_lock-${i}`, type: 'barn_lock' }))
     ]
 
-    // 확장팩 카드 추가
     if (gameMode === 'expansion') {
-      deck = deck.concat([
+      const expansionCards = [
         ...Array(16).fill().map((_, i) => ({ id: `beautiful_pig-${i}`, type: 'beautiful_pig' })),
         ...Array(12).fill().map((_, i) => ({ id: `escape-${i}`, type: 'escape' })),
         ...Array(4).fill().map((_, i) => ({ id: `lucky_bird-${i}`, type: 'lucky_bird' }))
-      ])
+      ]
+      return shuffleDeck([...basicCards, ...expansionCards])
     }
 
-    // 덱 셔플
-    return deck.sort(() => Math.random() - 0.5)
+    return shuffleDeck(basicCards)
   }
+
+  const shuffleDeck = (deck) => {
+    for (let i = deck.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [deck[i], deck[j]] = [deck[j], deck[i]]
+    }
+    return deck
+  }
+
   const createInitialGameState = (players, gameMode) => {
-    console.log('Creating initial game state for:', {
-      playerCount: players.length,
-      gameMode
+    const deck = createDeck(gameMode)
+    console.log('Initial deck created:', deck.map(card => ({id: card.id, type: card.type})))
+
+    const playerStates = players.map(player => {
+      const hand = deck.splice(0, 3)
+      console.log(`Initial hand for player ${player.id}:`, hand.map(card => ({id: card.id, type: card.type})))
+
+      return {
+        id: player.id,
+        name: player.name,
+        pigs: Array(3).fill().map((_, i) => ({
+          id: `${player.id}-pig-${i}`,  // 단순한 숫자 인덱스 사용
+          status: 'clean',
+          barn: null
+        })),
+        hand: hand,
+        ready: false
+      }
     })
 
-    const deck = createDeck(gameMode)
-    const playerStates = players.map(player => ({
-      id: player.id,
-      name: player.name,
-      pigs: Array(3).fill().map(() => ({
-        status: 'clean',
-        barn: null
-      })),
-      hand: deck.splice(0, 3),
-      ready: false
-    }))
-
-    return {
+    const initialState = {
       deck,
       discardPile: [],
       players: playerStates,
       currentPlayerIndex: 0,
       turnCount: 0,
-      gameMode
+      gameMode,
+      status: 'playing',
+      lastAction: null
+    }
+
+    console.log('Game initialized:', {
+      playerStates: initialState.players.map(p => ({
+        id: p.id,
+        handCount: p.hand.length,
+        cards: p.hand.map(card => ({id: card.id, type: card.type}))
+      })),
+      deckSize: initialState.deck.length
+    })
+
+    return initialState
+  }
+
+  // 게임 상태 검증 함수들
+  const validateGameAction = (room, playerId) => {
+    console.log('Validating game action:', { room, playerId })
+    if (!room) {
+      throw new Error('게임룸을 찾을 수 없습니다.')
+    }
+    if (room.status !== 'playing') {
+      throw new Error('게임이 진행중이 아닙니다.')
+    }
+    if (room.players[room.gameState.currentPlayerIndex].id !== playerId) {
+      throw new Error('자신의 턴이 아닙니다.')
     }
   }
 
-  // 연결 관리
+  const validateCardPlay = (gameState, cardId, playerId) => {
+    const player = gameState.players.find(p => p.id === playerId)
+    if (!player) {
+      console.log('Player validation failed:', {
+        searchId: playerId,
+        availablePlayers: gameState.players.map(p => p.id)
+      })
+      throw new Error('플레이어를 찾을 수 없습니다.')
+    }
+
+    console.log('Player hand check:', {
+      playerId,
+      handLength: player.hand?.length,
+      hand: player.hand
+    })
+
+    if (!player.hand || !Array.isArray(player.hand)) {
+      throw new Error('플레이어의 카드 정보가 올바르지 않습니다.')
+    }
+
+    const cardIndex = player.hand.findIndex(card => card.id === cardId)
+    if (cardIndex === -1) {
+      console.log('Card not found:', {
+        searchId: cardId,
+        availableCards: player.hand.map(c => c.id)
+      })
+      throw new Error('카드를 찾을 수 없습니다.')
+    }
+
+    return { player, cardIndex }
+  }
+
+  // 소켓 이벤트 핸들러
   io.on('connection', (socket) => {
     console.log('Client connected:', socket.id)
 
-    // 클라이언트 연결 상태 확인
-    socket.on('ping', () => {
-      socket.emit('pong')
-    })
+    // 연결 즉시 게임 목록 전송
+    broadcastGamesList()
 
+    // 연결 상태 확인
+    socket.on('ping', () => socket.emit('pong'))
 
-    // 게임 목록 조회
+    // 게임 목록 요청 처리
     socket.on('getGames', () => {
-      const gameList = Array.from(gameRooms.values())
-        .filter(room => room.status === 'waiting')
-        .map(room => ({
-          id: room.id,
-          playerCount: room.players.length,
-          maxPlayers: room.maxPlayers,
-          gameMode: room.gameMode,
-          owner: room.owner
-        }))
-      socket.emit('gamesList', gameList)
-    })
-
-    const broadcastGamesList = () => {
-      const gamesList = Array.from(gameRooms.values())
-        .filter(room => room.status === 'waiting')
-        .map(room => ({
-          id: room.id,
-          playerCount: room.players.length,
-          maxPlayers: room.maxPlayers,
-          gameMode: room.gameMode,
-          owner: room.owner
-        }))
-
-      io.emit('gamesList', gamesList)  // 모든 클라이언트에게 전송
-    }
-
-    socket.on('createGame', ({ gameMode = 'basic', maxPlayers = 4 }) => {
-      const roomId = nanoid(10)
-      const newRoom = {
-        id: roomId,
-        players: [{
-          id: socket.id,
-          name: `Player 1`,
-          ready: false
-        }],
-        maxPlayers,
-        gameMode,
-        status: 'waiting',
-        owner: socket.id,
-        gameState: null,
-        createdAt: Date.now()
-      }
-
-      gameRooms.set(roomId, newRoom)
-      socket.join(roomId)
-
-      // 게임 생성 알림
-      socket.emit('gameCreated', { roomId })
-
-      // 전체 게임 목록 업데이트를 모든 클라이언트에게 브로드캐스트
+      console.log('Games list requested by:', socket.id)
       broadcastGamesList()
-
-      console.log(`Game created: ${roomId}, Current games:`,
-        Array.from(gameRooms.keys()))
     })
 
-    // 방 참여 시
-    socket.on('joinRoom', ({ roomId, playerName }) => {
-      console.log(`Player ${playerName} trying to join room ${roomId}`)
-      const room = gameRooms.get(roomId)
+    // 게임 생성
+    socket.on('createGame', ({ gameMode = 'basic', maxPlayers = 4 }) => {
+      try {
+        console.log('Creating new game:', { gameMode, maxPlayers, creator: socket.id })
 
-      if (!room) {
-        socket.emit('joinError', { message: '존재하지 않는 게임입니다.' })
-        return
+        const roomId = nanoid(10)
+        const newRoom = {
+          id: roomId,
+          players: [{
+            id: socket.id,
+            name: `Player 1`,
+            ready: false
+          }],
+          maxPlayers,
+          gameMode,
+          status: 'waiting',
+          owner: socket.id,
+          gameState: null,
+          createdAt: Date.now()
+        }
+
+        gameRooms.set(roomId, newRoom)
+        socket.join(roomId)
+
+        // 생성된 방 정보 전송
+        socket.emit('gameCreated', { roomId, room: newRoom })
+
+        // 전체 게임 목록 즉시 업데이트
+        broadcastGamesList()
+
+        console.log('Game created:', roomId, 'Total games:', gameRooms.size)
+      } catch (error) {
+        console.error('Game creation error:', error)
+        socket.emit('error', { message: '게임 생성 중 오류가 발생했습니다.' })
       }
+    })
 
-      // 이미 방에 있는 플레이어인지 확인
-      const existingPlayer = room.players.find(p => p.id === socket.id)
-      if (!existingPlayer) {
+    socket.on('getGames', () => {
+      console.log('Games list requested by:', socket.id)
+      broadcastGamesList()
+    })
+
+    // 연결 시 게임 목록 전송
+    socket.on('connect', () => {
+      console.log('Client connected:', socket.id)
+      broadcastGamesList()
+    })
+
+    // 방 참여
+    socket.on('joinRoom', ({ roomId, playerName }) => {
+      try {
+        const room = gameRooms.get(roomId)
+        if (!room) {
+          throw new Error('존재하지 않는 게임입니다.')
+        }
+
         if (room.players.length >= room.maxPlayers) {
-          socket.emit('joinError', { message: '게임이 가득 찼습니다.' })
-          return
+          throw new Error('게임이 가득 찼습니다.')
         }
 
         if (room.status !== 'waiting') {
-          socket.emit('joinError', { message: '이미 시작된 게임입니다.' })
-          return
+          throw new Error('이미 시작된 게임입니다.')
         }
 
-        const newPlayer = {
-          id: socket.id,
-          name: playerName,
-          ready: false
+        const existingPlayer = room.players.find(p => p.id === socket.id)
+        if (!existingPlayer) {
+          room.players.push({
+            id: socket.id,
+            name: playerName,
+            ready: false
+          })
         }
-        room.players.push(newPlayer)
+
+        socket.join(roomId)
+        io.to(roomId).emit('roomState', {
+          id: roomId,
+          players: room.players,
+          owner: room.owner,
+          gameMode: room.gameMode,
+          maxPlayers: room.maxPlayers,
+          status: room.status
+        })
+
+        broadcastGamesList()
+
+      } catch (error) {
+        socket.emit('error', { message: error.message })
       }
-
-      socket.join(roomId)
-
-      const roomState = {
-        id: roomId,
-        players: room.players,
-        owner: room.owner,
-        gameMode: room.gameMode,
-        maxPlayers: room.maxPlayers,
-        status: room.status
-      }
-
-      // 모든 플레이어에게 업데이트된 상태 전송
-      io.to(roomId).emit('roomState', roomState)
-
-      // 게임 목록 업데이트
-      const gamesList = Array.from(gameRooms.values())
-        .filter(r => r.status === 'waiting')
-        .map(r => ({
-          id: r.id,
-          playerCount: r.players.length,
-          maxPlayers: r.maxPlayers,
-          gameMode: r.gameMode
-        }))
-
-      io.emit('gamesList', gamesList)
     })
 
     // 준비 상태 토글
     socket.on('toggleReady', ({ roomId, ready }) => {
-      const room = gameRooms.get(roomId)
-      if (!room) return
+      try {
+        const room = gameRooms.get(roomId)
+        if (!room) {
+          throw new Error('게임룸을 찾을 수 없습니다.')
+        }
 
-      const player = room.players.find(p => p.id === socket.id)
-      if (player) {
-        player.ready = ready
-        io.to(roomId).emit('roomState', {
-          players: room.players,
-          gameMode: room.gameMode,
-          owner: room.owner
-        })
+        const player = room.players.find(p => p.id === socket.id)
+        if (player) {
+          player.ready = ready
+          io.to(roomId).emit('roomState', {
+            players: room.players,
+            gameMode: room.gameMode,
+            owner: room.owner
+          })
+        }
+
+      } catch (error) {
+        socket.emit('error', { message: error.message })
       }
     })
 
     // 게임 시작
     socket.on('startGame', ({ roomId }) => {
-      console.log(`Attempting to start game in room ${roomId}`)
-      const room = gameRooms.get(roomId)
-
-      if (!room) {
-        socket.emit('error', { message: '게임룸을 찾을 수 없습니다.' })
-        return
-      }
-
-      if (room.owner !== socket.id) {
-        socket.emit('error', { message: '게임을 시작할 권한이 없습니다.' })
-        return
-      }
-
-      if (room.players.length < 2) {
-        socket.emit('error', { message: '최소 2명의 플레이어가 필요합니다.' })
-        return
-      }
-
-      if (!room.players.every(p => p.ready)) {
-        socket.emit('error', { message: '모든 플레이어가 준비를 완료해야 합니다.' })
-        return
-      }
-
       try {
+        const room = gameRooms.get(roomId)
+        if (!room) {
+          throw new Error('게임룸을 찾을 수 없습니다.')
+        }
+
+        if (room.owner !== socket.id) {
+          throw new Error('게임을 시작할 권한이 없습니다.')
+        }
+
+        if (room.players.length < 2) {
+          throw new Error('최소 2명의 플레이어가 필요합니다.')
+        }
+
+        if (!room.players.every(p => p.ready)) {
+          throw new Error('모든 플레이어가 준비를 완료해야 합니다.')
+        }
+
         room.status = 'playing'
         room.gameState = createInitialGameState(room.players, room.gameMode)
 
-        // 모든 클라이언트에게 게임 시작 알림과 초기 상태 전달
         io.to(roomId).emit('gameStarted', {
           ...room.gameState,
           roomId: room.id,
@@ -254,238 +305,295 @@ export default function (httpServer) {
           currentPlayerIndex: 0
         })
 
-        // 게임 리스트에서 제거
         broadcastGamesList()
 
-        console.log('Game started successfully:', {
-          roomId,
-          playersCount: room.players.length,
-          status: room.status
-        })
       } catch (error) {
-        console.error('Error starting game:', error)
-        socket.emit('error', { message: '게임 시작 중 오류가 발생했습니다.' })
+        socket.emit('error', { message: error.message })
+        console.error('Game start error:', error)
+      }
+    })
+
+    // 카드 뽑기
+    socket.on('drawCard', ({ roomId, playerId }) => {
+      try {
+        const room = gameRooms.get(roomId)
+        if (playerId !== socket.id) {
+          throw new Error('자신의 턴에만 카드를 뽑을 수 있습니다.')
+        }
+        validateGameAction(room, playerId)
+
+        const gameState = room.gameState
+        const currentPlayer = gameState.players.find(p => p.id === playerId)
+
+        if (!currentPlayer) {
+          throw new Error('플레이어를 찾을 수 없습니다.')
+        }
+
+        if (currentPlayer.hand.length >= 3) {
+          throw new Error('더 이상 카드를 뽑을 수 없습니다.')
+        }
+
+        // 덱이 비어있으면 버린 카드 덱을 섞어서 새로운 덱 만들기
+        if (gameState.deck.length === 0) {
+          if (gameState.discardPile.length === 0) {
+            throw new Error('더 이상 뽑을 카드가 없습니다.')
+          }
+          gameState.deck = shuffleDeck([...gameState.discardPile])
+          gameState.discardPile = []
+        }
+
+        const drawnCard = gameState.deck.pop()
+        currentPlayer.hand.push(drawnCard)
+
+        io.to(roomId).emit('cardDrawn', {
+          playerId: playerId,
+          handCount: currentPlayer.hand.length,
+        })
+
+        io.to(roomId).emit('gameStateUpdated', gameState)
+
+      } catch (error) {
+        socket.emit('error', { message: error.message })
+      }
+    })
+
+    // 카드 버리기
+    socket.on('discardCard', ({ roomId, cardId, playerId }) => {
+      console.log('Received discard request:', {
+        roomId, cardId, playerId,
+        socketId: socket.id,
+        matchesSocket: playerId === socket.id
+      })
+
+      try {
+        const room = gameRooms.get(roomId)
+        if (!room) {
+          throw new Error('게임룸을 찾을 수 없습니다.')
+        }
+
+        // 더 자세한 게임 상태 로깅
+        console.log('Current game state:', {
+          players: room.gameState.players.map(p => ({
+            id: p.id,
+            handSize: p.hand?.length,
+            cards: p.hand?.map(card => ({id: card.id, type: card.type}))
+          })),
+          currentPlayerIndex: room.gameState.currentPlayerIndex,
+          discardPileSize: room.gameState.discardPile.length
+        })
+
+        const currentPlayer = room.gameState.players.find(p => p.id === playerId)
+        if (!currentPlayer) {
+          console.log('Player not found:', {
+            searchId: playerId,
+            availablePlayers: room.gameState.players.map(p => p.id)
+          })
+          throw new Error('플레이어를 찾을 수 없습니다.')
+        }
+
+        // 권한 검증 - 자신의 카드만 버릴 수 있음
+        if (currentPlayer.id !== socket.id) {
+          throw new Error('자신의 카드만 버릴 수 있습니다.')
+        }
+
+        validateGameAction(room, playerId)
+
+        console.log('Found player:', {
+          playerId: currentPlayer.id,
+          handSize: currentPlayer.hand?.length,
+          cards: currentPlayer.hand?.map(c => c.id)
+        })
+
+        // 카드 찾기
+        const cardIndex = currentPlayer.hand.findIndex(card => card.id === cardId)
+        if (cardIndex === -1) {
+          console.log('Card not found in hand:', {
+            searchCardId: cardId,
+            playerHand: currentPlayer.hand.map(c => c.id)
+          })
+          throw new Error('카드를 찾을 수 없습니다.'+ JSON.stringify(currentPlayer.hand))
+        }
+
+        // 카드 버리기 처리
+        // 카드 버리기 처리
+        const discardedCard = currentPlayer.hand.splice(cardIndex, 1)[0]
+        room.gameState.discardPile.push(discardedCard)
+
+        // actionsRemaining 감소
+        room.gameState.actionsRemaining = Math.max(0, room.gameState.actionsRemaining - 1)
+
+        console.log('Card discarded successfully:', {
+          discardedCard,
+          newHandSize: currentPlayer.hand.length,
+          discardPileSize: room.gameState.discardPile.length,
+          actionsRemaining: room.gameState.actionsRemaining
+        })
+
+        // 이벤트 발송 시 현재 상태 정보 포함
+        io.to(roomId).emit('cardDiscarded', {
+          playerId: currentPlayer.id,
+          card: discardedCard,
+          handCount: currentPlayer.hand.length,
+          actionsRemaining: room.gameState.actionsRemaining
+        })
+
+        // 전체 게임 상태 업데이트를 명시적으로 전송
+        io.to(roomId).emit('gameStateUpdated', {
+          ...room.gameState,
+          players: room.gameState.players.map(p => ({
+            ...p,
+            hand: p.id === playerId ? p.hand : Array(p.hand.length).fill({ hidden: true })
+          }))
+        })
+
+      } catch (error) {
+        console.error('Discard card error:', error)
+        socket.emit('error', { message: error.message })
       }
     })
 
     // 카드 사용
-    socket.on('playCard', ({ roomId, cardId, targetId }) => {
-      const room = gameRooms.get(roomId)
-      if (!room || room.status !== 'playing') return
+    socket.on('playCard', ({ roomId, cardId, targetPigId, targetPlayerId, playerId }) => {
+      console.log('Received playCard event:', {
+        roomId, cardId, targetPigId, targetPlayerId, playerId
+      })
 
-      const gameState = room.gameState
-      const currentPlayer = gameState.players[gameState.currentPlayerIndex]
+      try {
+        const room = gameRooms.get(roomId)
+        if (!room) throw new Error('게임룸을 찾을 수 없습니다.')
 
-      if (currentPlayer.id !== socket.id) {
-        socket.emit('error', { message: '자신의 턴이 아닙니다.' })
-        return
-      }
-
-      // 카드 사용 처리 로직
-      const result = handleCardPlay(gameState, cardId, targetId)
-      if (result.success) {
-        gameState.lastAction = result.action
-        io.to(roomId).emit('gameStateUpdated', gameState)
-
-        // 승리 조건 체크
-        const winner = checkWinCondition(gameState)
-        if (winner) {
-          room.status = 'finished'
-          io.to(roomId).emit('gameEnded', { winner })
-        }
-      } else {
-        socket.emit('error', { message: result.message })
-      }
-    })
-
-    // 턴 종료
-    socket.on('endTurn', ({ roomId }) => {
-      const room = gameRooms.get(roomId)
-      if (!room || room.status !== 'playing') return
-
-      const gameState = room.gameState
-      if (gameState.players[gameState.currentPlayerIndex].id !== socket.id) return
-
-      // 다음 플레이어로 턴 전환
-      gameState.currentPlayerIndex = (gameState.currentPlayerIndex + 1) % gameState.players.length
-      gameState.turnCount++
-      gameState.lastAction = null
-
-      io.to(roomId).emit('gameStateUpdated', gameState)
-    })
-
-    // 게임 나가기
-    // 다른 이벤트에서도 게임 목록 업데이트가 필요할 때 broadcastGamesList 호출
-    socket.on('leaveRoom', ({ roomId }) => {
-      const room = gameRooms.get(roomId)
-      if (!room) return
-
-      handlePlayerLeave(room, socket.id)
-      socket.leave(roomId)
-
-      if (room.players.length === 0) {
-        gameRooms.delete(roomId)
-      } else {
-        io.to(roomId).emit('roomUpdated', {
-          players: room.players,
-          owner: room.owner,
-          gameMode: room.gameMode
+        // 게임 상태 로깅
+        console.log('Current game state:', {
+          players: room.gameState.players.map(p => ({
+            id: p.id,
+            pigs: p.pigs.map(pig => ({
+              id: pig.id,
+              status: pig.status
+            }))
+          })),
+          currentPlayerIndex: room.gameState.currentPlayerIndex
         })
-      }
 
-      broadcastGamesList()  // 게임 목록 업데이트
-    })
+        validateGameAction(room, playerId)
+        const gameState = room.gameState
 
-    socket.on('drawCard', ({ roomId }) => {
-      const room = gameRooms.get(roomId)
-      if (!room || room.status !== 'playing') return
+        const { player, cardIndex } = validateCardPlay(gameState, cardId, playerId)
+        const card = player.hand[cardIndex]
 
-      const gameState = room.gameState
-      const currentPlayer = gameState.players.find(p => p.id === socket.id)
+        console.log('Playing card:', {
+          card,
+          playerHand: player.hand,
+          targetPig: targetPigId,
+          targetPlayer: targetPlayerId
+        })
 
-      if (!currentPlayer) {
-        socket.emit('error', { message: '플레이어를 찾을 수 없습니다.' })
-        return
-      }
+        const result = handleCardPlay(gameState, card, targetPigId, targetPlayerId)
+        console.log('Card play result:', result)
 
-      if (currentPlayer.hand.length >= 3) {
-        socket.emit('error', { message: '더 이상 카드를 뽑을 수 없습니다.' })
-        return
-      }
-
-      // 덱에서 카드 뽑기
-      if (gameState.deck.length === 0) {
-        // 버린 카드 덱을 섞어서 새로운 덱 만들기
-        if (gameState.discardPile.length === 0) {
-          socket.emit('error', { message: '더 이상 뽑을 카드가 없습니다.' })
-          return
+        if (!result.success) {
+          throw new Error(result.message)
         }
-        gameState.deck = [...gameState.discardPile].sort(() => Math.random() - 0.5)
-        gameState.discardPile = []
-      }
 
-      const drawnCard = gameState.deck.pop()
-      currentPlayer.hand.push(drawnCard)
-
-      io.to(roomId).emit('cardDrawn', {
-        playerId: socket.id,
-        handCount: currentPlayer.hand.length
-      })
-
-      io.to(roomId).emit('gameStateUpdated', gameState)
-    })
-
-    socket.on('discardCard', ({ roomId, cardId }) => {
-      const room = gameRooms.get(roomId)
-      if (!room || room.status !== 'playing') return
-
-      const gameState = room.gameState
-      const currentPlayer = gameState.players.find(p => p.id === socket.id)
-
-      if (!currentPlayer) {
-        socket.emit('error', { message: '플레이어를 찾을 수 없습니다.' })
-        return
-      }
-
-      const cardIndex = currentPlayer.hand.findIndex(card => card.id === cardId)
-      if (cardIndex === -1) {
-        socket.emit('error', { message: '카드를 찾을 수 없습니다.' })
-        return
-      }
-
-      // 카드 버리기
-      const discardedCard = currentPlayer.hand.splice(cardIndex, 1)[0]
-      gameState.discardPile.push(discardedCard)
-
-      io.to(roomId).emit('cardDiscarded', {
-        playerId: socket.id,
-        card: discardedCard
-      })
-
-      io.to(roomId).emit('gameStateUpdated', gameState)
-    })
-
-// 기존의 playCard 핸들러 수정
-    socket.on('playCard', ({ roomId, cardId, targetPigId, targetPlayerId }) => {
-      const room = gameRooms.get(roomId)
-      if (!room || room.status !== 'playing') return
-
-      const gameState = room.gameState
-      const currentPlayer = gameState.players[gameState.currentPlayerIndex]
-
-      if (currentPlayer.id !== socket.id) {
-        socket.emit('error', { message: '자신의 턴이 아닙니다.' })
-        return
-      }
-
-      const cardIndex = currentPlayer.hand.findIndex(card => card.id === cardId)
-      if (cardIndex === -1) {
-        socket.emit('error', { message: '카드를 찾을 수 없습니다.' })
-        return
-      }
-
-      const card = currentPlayer.hand[cardIndex]
-      const result = handleCardPlay(gameState, card, targetPigId, targetPlayerId)
-
-      if (result.success) {
-        // 카드 제거 및 새 카드 뽑기
-        currentPlayer.hand.splice(cardIndex, 1)
+        // 카드 제거 및 효과 적용
+        player.hand.splice(cardIndex, 1)
         gameState.discardPile.push(card)
+        gameState.actionsRemaining--
 
+        // 이벤트 발송
         io.to(roomId).emit('cardPlayed', {
-          playerId: socket.id,
+          playerId,
           card,
           targetPigId,
           targetPlayerId,
           effect: result.effect
         })
 
+        // 게임 상태 업데이트
+        io.to(roomId).emit('gameStateUpdated', {
+          ...gameState,
+          players: gameState.players.map(p => ({
+            ...p,
+            hand: p.id === playerId ? p.hand : Array(p.hand.length).fill({ hidden: true })
+          }))
+        })
+
+      } catch (error) {
+        console.error('Error in playCard:', error)
+        socket.emit('error', { message: error.message })
+      }
+    })
+
+    // 턴 종료
+    socket.on('endTurn', ({ roomId, playerId }) => {
+      try {
+        const room = gameRooms.get(roomId)
+        if (playerId !== socket.id) {
+          throw new Error('자신의 턴만 종료할 수 있습니다.')
+        }
+        validateGameAction(room, playerId)
+
+        const gameState = room.gameState
+
+        // 현재 턴 종료 알림
+        io.to(roomId).emit('turnEnded', {
+          playerId: playerId
+        })
+
+        // 다음 플레이어로 턴 전환
+        gameState.currentPlayerIndex = (gameState.currentPlayerIndex + 1) % gameState.players.length
+        gameState.turnCount++
+        gameState.lastAction = null
+
+        // 새로운 턴 시작 알림
+        io.to(roomId).emit('turnStarted', {
+          playerId: gameState.players[gameState.currentPlayerIndex].id,
+          turnCount: gameState.turnCount
+        })
+
         io.to(roomId).emit('gameStateUpdated', gameState)
 
-        // 승리 조건 체크
-        const winner = checkWinCondition(gameState)
-        if (winner) {
-          room.status = 'finished'
-          io.to(roomId).emit('gameEnded', { winner })
+      } catch (error) {
+        socket.emit('error', { message: error.message })
+      }
+    })
+
+    // 게임방 나가기
+    socket.on('leaveRoom', ({ roomId }) => {
+      try {
+        const room = gameRooms.get(roomId)
+        if (!room) return
+
+        handlePlayerLeave(room, socket.id)
+        socket.leave(roomId)
+
+        if (room.players.length === 0) {
+          gameRooms.delete(roomId)
+        } else {
+          io.to(roomId).emit('roomUpdated', {
+            players: room.players,
+            owner: room.owner,
+            gameMode: room.gameMode
+          })
         }
-      } else {
-        socket.emit('error', { message: result.message })
+
+        broadcastGamesList()
+
+      } catch (error) {
+        console.error('Leave room error:', error)
       }
     })
 
-  // 기존의 endTurn 핸들러 수정
-    socket.on('endTurn', ({ roomId }) => {
-      const room = gameRooms.get(roomId)
-      if (!room || room.status !== 'playing') return
-
-      const gameState = room.gameState
-      if (gameState.players[gameState.currentPlayerIndex].id !== socket.id) {
-        socket.emit('error', { message: '자신의 턴이 아닙니다.' })
-        return
-      }
-
-      // 현재 턴 종료 알림
-      io.to(roomId).emit('turnEnded', {
-        playerId: socket.id
-      })
-
-      // 다음 플레이어로 턴 전환
-      gameState.currentPlayerIndex = (gameState.currentPlayerIndex + 1) % gameState.players.length
-      gameState.turnCount++
-
-      // 새로운 턴 시작 알림
-      io.to(roomId).emit('turnStarted', {
-        playerId: gameState.players[gameState.currentPlayerIndex].id,
-        turnCount: gameState.turnCount
-      })
-
-      io.to(roomId).emit('gameStateUpdated', gameState)
+    socket.on('connect', () => {
+      console.log('Client connected:', socket.id)
+      broadcastGamesList()  // 연결 직후 현재 게임 목록 전송
     })
 
-    // 연결 해제
-    // 연결 해제 시에도 게임 목록 업데이트
+    // 연결 해제 핸들러 수정
     socket.on('disconnect', () => {
       console.log('Client disconnected:', socket.id)
+      let roomUpdated = false
+
+      // 플레이어가 속한 방 찾기 및 업데이트
       for (const [roomId, room] of gameRooms.entries()) {
         if (room.players.some(p => p.id === socket.id)) {
           handlePlayerLeave(room, socket.id)
@@ -499,49 +607,135 @@ export default function (httpServer) {
               gameMode: room.gameMode
             })
           }
+          roomUpdated = true
         }
       }
 
-      broadcastGamesList()  // 게임 목록 업데이트
+      // 방 정보가 변경되었다면 게임 목록 업데이트
+      if (roomUpdated) {
+        broadcastGamesList()
+      }
     })
   })
 
-  // 플레이어 퇴장 처리
-  const handlePlayerLeave = (room, playerId) => {
+  // 유틸리티 함수들
+  function handlePlayerLeave(room, playerId) {
     room.players = room.players.filter(p => p.id !== playerId)
     if (room.owner === playerId && room.players.length > 0) {
       room.owner = room.players[0].id
     }
   }
 
-  // 게임 상태 정리 (오래된 게임 룸 제거)
+  // 게임 목록 브로드캐스트 함수를 먼저 정의
+  function broadcastGamesList() {
+    try {
+      const gamesList = Array.from(gameRooms.values())
+        .filter(room => room.status === 'waiting')
+        .map(room => ({
+          id: room.id,
+          playerCount: room.players.length,
+          maxPlayers: room.maxPlayers,
+          gameMode: room.gameMode,
+          owner: room.owner,
+          status: room.status
+        }))
+
+      // 전체 클라이언트에게 즉시 브로드캐스트
+      io.sockets.emit('gamesList', gamesList)
+      console.log('Broadcasting games list:', gamesList)
+    } catch (error) {
+      console.error('Error broadcasting games list:', error)
+    }
+  }
+
+  // 더 자주 브로드캐스트하도록 설정
+  const BROADCAST_INTERVAL = 2000  // 2초마다
+  setInterval(broadcastGamesList, BROADCAST_INTERVAL)
+
   setInterval(() => {
+    // 오래된 게임 정리
     const now = Date.now()
     for (const [roomId, room] of gameRooms.entries()) {
       if (room.status === 'waiting' && now - room.createdAt > 24 * 60 * 60 * 1000) {
         gameRooms.delete(roomId)
       }
     }
-  }, 60 * 60 * 1000) // 1시간마다 체크
+    // 게임 목록 브로드캐스트
+    broadcastGamesList()
+  }, 3000)  // 3초마다 실행
 
+  // 주기적인 게임 목록 업데이트 및 정리
+  const SYNC_INTERVAL = 3000 // 3초
+  setInterval(() => {
+    // 오래된 게임 정리
+    const now = Date.now()
+    let needsUpdate = false
+
+    for (const [roomId, room] of gameRooms.entries()) {
+      // 24시간 이상 된 대기 중인 게임 삭제
+      if (room.status === 'waiting' && now - room.createdAt > 24 * 60 * 60 * 1000) {
+        gameRooms.delete(roomId)
+        needsUpdate = true
+      }
+    }
+
+    // 변경사항이 있을 때만 브로드캐스트
+    if (needsUpdate) {
+      broadcastGamesList()
+    }
+  }, SYNC_INTERVAL)
   return io
 }
 
-// 카드 사용 처리 로직
+
 function handleCardPlay(gameState, card, targetPigId, targetPlayerId) {
+  console.log('Handle card play input:', {
+    card,
+    targetPigId,
+    targetPlayerId,
+    currentPlayerIndex: gameState.currentPlayerIndex,
+  })
+
   const currentPlayer = gameState.players[gameState.currentPlayerIndex]
   const targetPlayer = targetPlayerId ?
     gameState.players.find(p => p.id === targetPlayerId) : currentPlayer
+
+  if (!targetPlayer) {
+    return { success: false, message: '대상 플레이어를 찾을 수 없습니다.' }
+  }
+
+  console.log('Finding target pig:', {
+    targetPigId,
+    availablePigIds: targetPlayer.pigs.map(p => p.id)
+  })
+
+  // 돼지 ID의 인덱스 부분만 추출하여 비교
   const targetPig = targetPigId ?
-    targetPlayer.pigs.find(pig => pig.id === targetPigId) : null
+    targetPlayer.pigs.find(pig => {
+      const pigIndex = pig.id.split('-').pop()
+      const targetIndex = targetPigId.split('-').pop()
+      return pigIndex === targetIndex
+    }) : null
+
+  if (!targetPig) {
+    return { success: false, message: '대상 돼지를 찾을 수 없습니다.' }
+  }
 
   switch (card.type) {
-    case 'mud':
-      // 진흙 카드: 깨끗한 돼지를 더럽힘
-      if (!targetPig || targetPig.status !== 'clean') {
+    case 'mud': {
+      console.log('Attempting to apply mud card:', {
+        pigId: targetPig.id,
+        currentStatus: targetPig.status
+      })
+
+      if (targetPig.status !== 'clean') {
+        console.log('Invalid pig status for mud:', targetPig.status)
         return { success: false, message: '깨끗한 돼지만 더럽힐 수 있습니다.' }
       }
+
       targetPig.status = 'dirty'
+      console.log('Pig status changed to:', targetPig.status)
+
       return {
         success: true,
         effect: {
@@ -552,6 +746,7 @@ function handleCardPlay(gameState, card, targetPigId, targetPlayerId) {
           to: 'dirty'
         }
       }
+    }
 
     case 'barn':
       // 헛간 카드: 돼지에게 헛간 설치

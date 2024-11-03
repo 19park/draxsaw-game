@@ -7,32 +7,43 @@
     <div v-if="gameStore.currentRoom" class="waiting-room">
       <div class="room-header">
         <h2 class="subtitle">
-          대기실 #{{ gameStore.currentRoom.id }}
-          <span class="game-mode-badge" :class="gameStore.currentRoom.gameMode">
-            {{ gameStore.currentRoom.gameMode === 'basic' ? '기본' : '확장팩' }} 모드
+          대기실 #{{ gameStore.roomState.roomId }}
+          <span
+            class="game-mode-badge"
+            :class="gameStore.roomState.gameMode"
+          >
+            {{ gameStore.roomState.gameMode === 'basic' ? '기본' : '확장팩' }} 모드
           </span>
         </h2>
         <div class="player-counter">
-          {{ gameStore.currentRoom.players.length }}/4 플레이어
+          {{ playerCount }}/{{ gameStore.roomState.maxPlayers }} 플레이어
         </div>
       </div>
 
       <div class="players-grid">
         <!-- 현재 참가자 -->
-        <div v-for="(player, index) in gameStore.currentRoom.players"
-             :key="player.id"
-             class="player-slot"
-             :class="{ 'ready': player.ready }">
+        <div
+          v-for="player in gameStore.roomPlayers"
+          :key="player.id"
+          class="player-slot"
+          :class="{
+            'ready': player.ready,
+            'is-me': isCurrentPlayer(player.id)
+          }"
+        >
           <div class="player-content">
-            <div class="player-avatar">{{ player.name[0].toUpperCase() }}</div>
+            <div class="player-avatar">{{ getPlayerInitial(player.name) }}</div>
             <div class="player-info">
               <span class="player-name">
                 {{ player.name }}
-                <span v-if="player.id === gameStore.currentRoom.owner" class="owner-badge">
+                <span v-if="isRoomOwner(player.id)" class="owner-badge">
                   방장
                 </span>
               </span>
-              <span class="ready-status" :class="{ 'is-ready': player.ready }">
+              <span
+                class="ready-status"
+                :class="{ 'is-ready': player.ready }"
+              >
                 {{ player.ready ? '준비 완료!' : '대기 중...' }}
               </span>
             </div>
@@ -40,9 +51,11 @@
         </div>
 
         <!-- 빈 슬롯 -->
-        <div v-for="i in (4 - gameStore.currentRoom.players.length)"
-             :key="`empty-${i}`"
-             class="player-slot empty">
+        <div
+          v-for="i in remainingSlots"
+          :key="`empty-${i}`"
+          class="player-slot empty"
+        >
           <div class="empty-slot-content">
             <span class="empty-slot-text">빈 자리</span>
           </div>
@@ -50,23 +63,27 @@
       </div>
 
       <div class="room-controls">
-        <button v-if="isRoomOwner"
-                class="start-button"
-                :disabled="!canStartGame"
-                @click="startGame">
+        <button
+          v-if="isOwner"
+          class="start-button"
+          :disabled="!canStartGame"
+          @click="startGame"
+        >
           게임 시작
         </button>
-        <button class="ready-button"
-                :class="{ 'is-ready': gameStore.isReady }"
-                @click="toggleReady">
-          {{ gameStore.isReady ? '준비 해제' : '준비하기' }}
+        <button
+          class="ready-button"
+          :class="{ 'is-ready': gameStore.roomState.isReady }"
+          @click="toggleReady"
+        >
+          {{ gameStore.roomState.isReady ? '준비 해제' : '준비하기' }}
         </button>
         <button class="leave-button" @click="leaveRoom">
           나가기
         </button>
       </div>
 
-      <div v-if="!canStartGame && isRoomOwner" class="status-message">
+      <div v-if="!canStartGame && isOwner" class="status-message">
         {{ startGameMessage }}
       </div>
     </div>
@@ -77,119 +94,213 @@
         <h2 class="subtitle">새 게임 만들기</h2>
         <div class="form-group">
           <label>게임 모드</label>
-          <select v-model="gameStore.gameMode">
+          <select v-model="selectedGameMode" class="mode-select">
             <option value="basic">기본 게임</option>
             <option value="expansion">확장팩 게임</option>
           </select>
         </div>
-        <button class="create-button" @click="createGame">
-          게임 만들기
+        <div class="form-group">
+          <label>최대 인원</label>
+          <select v-model="maxPlayers" class="players-select">
+            <option v-for="n in 3" :key="n" :value="n + 2">
+              {{ n + 2 }}명
+            </option>
+          </select>
+        </div>
+        <button
+          class="create-button"
+          @click="createGame"
+          :disabled="!isConnected"
+        >
+          {{ isConnected ? '게임 만들기' : '연결 중...' }}
         </button>
       </div>
 
       <GamesList
         :games="gameStore.games"
         @join="handleJoinGame"
+        @refresh="refreshGames"
       />
     </div>
 
     <!-- 소켓 상태 표시 -->
-    <div v-if="isDevelopment" class="socket-status">
-      <p>Socket Status: {{ socketStatus }}</p>
+    <div class="socket-status">
+      <div :class="['status-indicator', socketStatus.status]">
+        {{ getStatusMessage }}
+      </div>
+      <p v-if="socketStatus.error" class="error-message">
+        {{ socketStatus.error }}
+      </p>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import GamesList from "~/components/game/GamesList.vue"
 import { useGameStore } from '~/composables/useGameStore'
 import { useSocketEvents } from '~/composables/useSocketEvents'
+import { useSocketStatus } from '~/composables/useSocketStatus'
 
 const router = useRouter()
 const { $socket } = useNuxtApp()
 const gameStore = useGameStore()
 const { setupLobbyEvents, clearEvents } = useSocketEvents()
+const socketStatus = useSocketStatus()
 
 // 상태 관리
-const socketStatus = ref('disconnected')
-const isDevelopment = process.env.NODE_ENV === 'development'
+const selectedGameMode = ref('basic')
+const maxPlayers = ref(4)
+const refreshInterval = ref(null)
 
-// 계산된 속성
-const isRoomOwner = computed(() => {
-  return gameStore.currentRoom?.owner === $socket.id
+// computed 속성들
+const isConnected = computed(() => socketStatus.status.value === 'connected')
+
+const getStatusMessage = computed(() => {
+  switch (socketStatus.status.value) {
+    case 'connected':
+      return '서버와 연결됨'
+    case 'disconnected':
+      return '연결 끊김'
+    case 'error':
+      return '연결 오류'
+    default:
+      return '연결 중...'
+  }
 })
 
+const isOwner = computed(() => gameStore.isRoomOwner)
+
+const playerCount = computed(() => gameStore.roomPlayers.length)
+
+const remainingSlots = computed(() =>
+  gameStore.roomState.maxPlayers - playerCount.value
+)
+
 const canStartGame = computed(() => {
-  if (!gameStore.currentRoom) return false
-  return gameStore.currentRoom.players.length >= 2 &&
-    gameStore.currentRoom.players.every(player => player.ready)
+  return playerCount.value >= 2 &&
+    gameStore.roomPlayers.every(player => player.ready)
 })
 
 const startGameMessage = computed(() => {
-  if (!gameStore.currentRoom) return ''
-  if (gameStore.currentRoom.players.length < 2) {
+  if (playerCount.value < 2) {
     return '최소 2명의 플레이어가 필요합니다'
   }
-  if (!gameStore.currentRoom.players.every(player => player.ready)) {
+  if (!gameStore.roomPlayers.every(player => player.ready)) {
     return '모든 플레이어가 준비를 완료해야 합니다'
   }
   return ''
 })
+// methods
+const isCurrentPlayer = (playerId) => {
+  return playerId === $socket?.id
+}
 
+const isRoomOwner = (playerId) => {
+  return playerId === gameStore.roomState.owner
+}
+
+const getPlayerInitial = (name) => {
+  return name ? name[0].toUpperCase() : '?'
+}
+
+const generatePlayerName = () => {
+  return `Player_${Math.random().toString(36).substring(7)}`
+}
+
+// 게임 액션 메서드들
 const createGame = () => {
+  if (!isConnected.value) {
+    socketStatus.error.value = '서버와 연결되지 않았습니다.'
+    return
+  }
+
+  console.log('Creating new game...')
   $socket.emit('createGame', {
-    gameMode: gameStore.gameMode,
-    maxPlayers: 4
+    gameMode: selectedGameMode.value,
+    maxPlayers: maxPlayers.value
   })
 }
 
 const handleJoinGame = (gameId) => {
-  const playerName = `Player_${Math.random().toString(36).substring(7)}`
+  if (!isConnected.value) {
+    socketStatus.error.value = '서버와 연결되지 않았습니다.'
+    return
+  }
+
+  const playerName = generatePlayerName()
   $socket.emit('joinRoom', {
     roomId: gameId,
-    playerName: playerName
+    playerName
   })
   router.push(`/game/${gameId}`)
 }
 
 const toggleReady = () => {
+  if (!gameStore.roomState.roomId || !isConnected.value) return
+
   $socket.emit('toggleReady', {
-    roomId: gameStore.currentRoom.id,
-    ready: !gameStore.isReady
+    roomId: gameStore.roomState.roomId,
+    ready: !gameStore.roomState.isReady
   })
 }
 
-const leaveRoom = () => {
-  $socket.emit('leaveRoom', { roomId: gameStore.currentRoom.id })
-  gameStore.setCurrentRoom(null)
+const leaveRoom = async () => {
+  if (gameStore.roomState.roomId && isConnected.value) {
+    $socket.emit('leaveRoom', {
+      roomId: gameStore.roomState.roomId
+    })
+    gameStore.leaveRoom()
+  }
+  await router.push('/lobby')
 }
 
 const startGame = () => {
-  if (!canStartGame.value) return
-  $socket.emit('startGame', { roomId: gameStore.currentRoom.id })
+  if (!canStartGame.value || !isConnected.value) return
+
+  $socket.emit('startGame', {
+    roomId: gameStore.roomState.roomId
+  })
 }
 
-onMounted(() => {
-  setupLobbyEvents()
-  gameStore.setLocalPlayerId($socket.id) // 로컬 플레이어 ID 설정
-
-  $socket.on('connect', () => {
-    socketStatus.value = 'connected'
+const refreshGames = () => {
+  if (isConnected.value) {
     $socket.emit('getGames')
-  })
+  }
+}
 
-  $socket.on('connect_error', () => {
-    socketStatus.value = 'error'
-  })
+// 게임 목록 자동 갱신 설정
+const setupGameListRefresh = () => {
+  refreshGames()
 
-  $socket.on('disconnect', () => {
-    socketStatus.value = 'disconnected'
+  refreshInterval.value = setInterval(() => {
+    if (isConnected.value) {
+      refreshGames()
+    }
+  }, 3000)
+}
+
+// Lifecycle hooks
+onMounted(() => {
+  socketStatus.setupSocketListeners()
+  setupLobbyEvents()
+  setupGameListRefresh()
+
+  // 연결 상태 변화 감시
+  watch(() => socketStatus.status.value, (newStatus) => {
+    console.log('Socket status changed:', newStatus)
+    if (newStatus === 'connected') {
+      refreshGames()
+    }
   })
 })
 
 onUnmounted(() => {
+  if (refreshInterval.value) {
+    clearInterval(refreshInterval.value)
+  }
+  socketStatus.clearSocketListeners()
   clearEvents([
     'gamesList',
     'gameCreated',
@@ -198,11 +309,46 @@ onUnmounted(() => {
     'disconnect'
   ])
 })
+
+// 스타일
 </script>
 
-
 <style scoped>
-/* 기존 스타일 유지 */
+.lobby-container {
+  @apply max-w-4xl mx-auto p-8;
+}
+
+.title {
+  @apply text-3xl font-bold text-center mb-8;
+}
+
+.subtitle {
+  @apply text-xl font-semibold mb-4;
+}
+
+.create-game {
+  @apply mb-8 p-6 bg-white rounded-lg shadow;
+}
+
+.form-group {
+  @apply mb-4;
+}
+
+.form-group label {
+  @apply block text-sm font-medium text-gray-700 mb-2;
+}
+
+.mode-select, .players-select {
+  @apply w-full p-2 border rounded-lg shadow-sm
+  focus:ring-2 focus:ring-blue-500 focus:border-blue-500;
+}
+
+.create-button {
+  @apply w-full py-2 bg-blue-500 text-white rounded-lg
+  hover:bg-blue-600 transition-colors
+  disabled:opacity-50 disabled:cursor-not-allowed;
+}
+
 .waiting-room {
   @apply bg-white rounded-lg shadow-lg p-6 mb-8;
 }
@@ -253,12 +399,11 @@ onUnmounted(() => {
 }
 
 .player-name {
-  @apply font-medium;
+  @apply font-medium flex items-center gap-2;
 }
 
 .owner-badge {
-  @apply ml-2 px-2 py-0.5 text-xs bg-yellow-100
-  text-yellow-800 rounded;
+  @apply ml-2 px-2 py-0.5 text-xs bg-yellow-100 text-yellow-800 rounded;
 }
 
 .ready-status {
@@ -297,82 +442,33 @@ onUnmounted(() => {
   @apply mt-4 text-center text-sm text-gray-600;
 }
 
-.empty-slot-content {
-  @apply h-full flex items-center justify-center;
-}
-
-.empty-slot-text {
-  @apply text-gray-400 text-sm;
-}
-
-.lobby-container {
-  @apply max-w-4xl mx-auto p-8;
-}
-
-.title {
-  @apply text-3xl font-bold text-center mb-8;
-}
-
-.subtitle {
-  @apply text-xl font-semibold mb-4;
-}
-
-.create-game {
-  @apply mb-8 p-6 bg-white rounded-lg shadow;
-}
-
-.form-group {
-  @apply mb-4;
-}
-
-.form-group label {
-  @apply block text-sm font-medium text-gray-700 mb-2;
-}
-
-.form-group select {
-  @apply w-full p-2 border rounded;
-}
-
-.create-button {
-  @apply w-full py-2 bg-blue-500 text-white rounded hover:bg-blue-600
-  transition-colors;
-}
-
-.games-list {
-  @apply space-y-4;
-}
-
-.game-item {
-  @apply flex justify-between items-center p-4 bg-white rounded-lg shadow;
-}
-
-.game-info {
-  @apply flex gap-4 items-center;
-}
-
-.game-id {
-  @apply font-medium;
-}
-
-.player-count {
-  @apply text-sm text-gray-500;
-}
-
-.game-mode {
-  @apply text-sm text-gray-500;
-}
-
-.join-button {
-  @apply px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600
-  transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
-}
-
-.no-games {
-  @apply text-center text-gray-500 py-8;
-}
-
 .socket-status {
-  @apply fixed bottom-4 right-4 p-2 bg-gray-800 text-white rounded-lg
-  text-sm opacity-75;
+  @apply fixed bottom-4 right-4 p-3 bg-gray-800 text-white rounded-lg
+  shadow-lg opacity-75 transition-all duration-300;
+}
+
+.status-indicator {
+  @apply flex items-center gap-2 font-medium;
+}
+
+.status-indicator::before {
+  content: '';
+  @apply w-2 h-2 rounded-full;
+}
+
+.status-indicator.connected::before {
+  @apply bg-green-400;
+}
+
+.status-indicator.disconnected::before {
+  @apply bg-red-400;
+}
+
+.status-indicator.error::before {
+  @apply bg-yellow-400;
+}
+
+.error-message {
+  @apply text-xs text-red-300 mt-2;
 }
 </style>

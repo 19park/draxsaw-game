@@ -43,52 +43,66 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
-import {useGameStore} from "~/composables/useGameStore.js";
+  import { ref, computed } from 'vue'
+  import { useGameStore } from "~/composables/useGameStore"
 
-const props = defineProps({
-  isCurrentTurn: {
-    type: Boolean,
-    required: true
-  },
-  selectedCard: {
-    type: Object,
-    default: null
+  const props = defineProps({
+    isCurrentTurn: {
+      type: Boolean,
+      required: true
+    },
+    selectedCard: {
+      type: Object,
+      default: null
+    },
+    canPlaySelected: {
+      type: Boolean,
+      default: false
+    },
+    canEndTurn: {
+      type: Boolean,
+      default: false
+    },
+    remainingActions: {
+      type: Number,
+      default: 0
+    }
+  })
+
+  const emit = defineEmits(['playCard', 'discardCard', 'endTurn'])
+
+  const gameStore = useGameStore()
+  const gameMessage = ref('')
+  const messageType = ref('info')
+
+  const handlePlayCard = () => {
+    if (!props.selectedCard || !props.isCurrentTurn) return
+
+    console.log('Playing card:', props.selectedCard)
+    emit('playCard', props.selectedCard)
   }
-})
 
-const emit = defineEmits(['playCard', 'discardCard', 'endTurn'])
+  const handleDiscardCard = () => {
+    if (!props.selectedCard || !props.isCurrentTurn) return
 
-const gameStore = useGameStore()
-const gameMessage = ref('')
-const messageType = ref('info')
+    console.log('Discarding card:', props.selectedCard)
+    emit('discardCard', props.selectedCard)
+  }
 
-const remainingActions = computed(() => {
-  return gameStore.remainingActions
-})
+  const handleEndTurn = () => {
+    if (!props.isCurrentTurn || props.remainingActions > 0) return
 
-const handlePlayCard = () => {
-  if (!props.selectedCard) return
-  emit('playCard', props.selectedCard)
-}
+    console.log('Ending turn')
+    emit('endTurn')
+  }
 
-const handleDiscardCard = () => {
-  if (!props.selectedCard) return
-  emit('discardCard', props.selectedCard)
-}
-
-const handleEndTurn = () => {
-  if (remainingActions.value > 0) return
-  emit('endTurn')
-}
-
-const showMessage = (message, type = 'info') => {
-  gameMessage.value = message
-  messageType.value = type
-  setTimeout(() => {
-    gameMessage.value = ''
-  }, 3000)
-}
+  const showMessage = (message, type = 'info') => {
+    gameMessage.value = message
+    messageType.value = type
+    setTimeout(() => {
+      gameMessage.value = ''
+    }, 3000)
+  }
 </script>
 
 <style scoped>

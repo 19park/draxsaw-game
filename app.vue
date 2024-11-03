@@ -8,6 +8,7 @@
 </template>
 
 <script setup>
+import { onMounted, onUnmounted } from 'vue'
 import { useSocketEvents } from '~/composables/useSocketEvents'
 
 const { setupGlobalEvents, clearEvents } = useSocketEvents()
